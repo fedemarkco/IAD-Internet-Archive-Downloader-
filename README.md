@@ -1,2 +1,2 @@
 # IAD (Internet Archive Downloader)
-Download from https://archive.org/, with speeds that can exceed 30 MB/s.
+Descarga archivos desde https://archive.org/, con velocidades que pueden superar los 30 MB/s.
