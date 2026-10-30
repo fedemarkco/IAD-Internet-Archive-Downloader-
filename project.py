@@ -40,25 +40,49 @@ class Archive_org(QObject):
     self.PATHD = os.path.dirname(__file__) + '\\'
 
   def login(self):
-    urlLogin = "https://archive.org/account/login"
-    sourceLogin = requests.get(urlLogin)
-    sourcePost = requests.post(
-      urlLogin, 
-      cookies=sourceLogin.cookies, 
-      headers = {
-        "Referer": "https://archive.org/account/login"
-      }, 
-      data = {
-        "username": self.user, 
-        "password": self.password, 
-        "remember": "true", 
-        "referer": "https://archive.org/", 
-        "login": "true", 
-        "submit_by_js": "true"
-      }
-    )
-    self._response.emit(sourcePost)
+    """Autenticacion a Internet Archive mediante el endpoint xauthn."""
+    try:
+      respuesta = requests.post(
+        "https://archive.org/services/xauthn/",
+        params={"op": "login"},
+        data={"email": self.user.strip(), "password": self.password},
+        timeout=20
+      )
+      respuesta.raise_for_status()
+      datos = respuesta.json()
+      valores = datos.get("values") or {}
 
+      if datos.get("success"):
+        cookies = valores.get("cookies") or {}
+        usuario = cookies.get("logged-in-user")
+        firma = cookies.get("logged-in-sig")
+        if not usuario or not firma:
+          self._response.emit({
+            "success": False,
+            "error": "El servidor acepto el inicio de sesion, pero no devolvio las cookies requeridas."
+          })
+          return
+        self._response.emit({
+          "success": True,
+          "cookies": {"logged-in-user": usuario, "logged-in-sig": firma}
+        })
+      else:
+        motivo = valores.get("reason") or datos.get("error") or "Error de autenticacion desconocido"
+        traducciones = {
+          "account_not_found": "No existe una cuenta asociada a ese correo.",
+          "account_bad_password": "Contrasena incorrecta.",
+          "account_locked": "La cuenta esta bloqueada.",
+          "account_not_verified": "La cuenta necesita verificar su correo.",
+        }
+        self._response.emit({
+          "success": False,
+          "error": traducciones.get(str(motivo), str(motivo))
+        })
+    except (requests.RequestException, ValueError) as exc:
+      self._response.emit({
+        "success": False,
+        "error": "Error de conexion o de respuesta del servidor: " + str(exc)
+      })
   def strip_tags(self, value):
     return re.compile(r'<[^<]*?/?>').sub("", value)
 
@@ -444,7 +468,7 @@ class WLogin(QDialog):
     self.message.setStyleSheet("color: red;")
 
     self.user = QLineEdit("")
-    self.user.setPlaceholderText("user")
+    self.user.setPlaceholderText("email")
     self.passw = QLineEdit("")
     self.passw.setPlaceholderText("password")
     self.passw.setEchoMode(QLineEdit.Password)
@@ -486,18 +510,19 @@ class WLogin(QDialog):
   
   @pyqtSlot(object)
   def loginT(self, response):
-    message = response.text
-    self.cookies = response.cookies
-
-    if "successful login" in str(message).lower():
+    if response.get("success"):
+      self.cookies = response["cookies"]
       self.message.setText("Success")
       self.message.repaint()
       self.accept()
-      _main = Main(self)
-      _main.show()
+      self._main = Main(self)
+      self._main.show()
     else:
       self.message.setText("Failed")
-      self.message.repaint()
+      QMessageBox.warning(
+        self, "Error de inicio de sesion",
+        str(response.get("error") or "No fue posible iniciar sesion.")
+      )
     self.buttonLogin.setEnabled(True)
 
 class ProgressBar(QProgressBar):
