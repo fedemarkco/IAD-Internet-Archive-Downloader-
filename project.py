@@ -40,21 +40,21 @@ class Archive_org(QObject):
     self.PATHD = os.path.dirname(__file__) + '\\'
 
   def login(self):
-    urlLogin = "https://archive.org/account/login"
-    sourceLogin = requests.get(urlLogin)
+    urlLogin = "https://archive.org/services/account/login/"
+    urlCsrfToken = "https://archive.org/services/csrf-token"
+    response = requests.get(urlCsrfToken)
+    csrfToken = response.json()["value"]["token"]
     sourcePost = requests.post(
       urlLogin, 
-      cookies=sourceLogin.cookies, 
-      headers = {
-        "Referer": "https://archive.org/account/login"
-      }, 
-      data = {
+      headers={
+        "x-csrf-token": csrfToken,
+      },
+      cookies=response.cookies,
+      json = {
         "username": self.user, 
         "password": self.password, 
         "remember": "true", 
-        "referer": "https://archive.org/", 
-        "login": "true", 
-        "submit_by_js": "true"
+        "t": csrfToken
       }
     )
     self._response.emit(sourcePost)
@@ -486,10 +486,9 @@ class WLogin(QDialog):
   
   @pyqtSlot(object)
   def loginT(self, response):
-    message = response.text
+    message = response.json()
     self.cookies = response.cookies
-
-    if "successful login" in str(message).lower():
+    if message.get("success", None):
       self.message.setText("Success")
       self.message.repaint()
       self.accept()
