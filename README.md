@@ -1,25 +1,49 @@
-# IAD (Internet Archive Downloader)
-Descarga archivos desde https://archive.org/, con velocidades que pueden superar los 30 MB/s.
+# IAD v2 — Internet Archive Downloader
 
-## Origen
-He visto por internet que hay aplicaciones de terceros para descargar de Internet Archive, también extensiones para Chrome, en la página oficial de archive.org se encuentra otra aplicación y con internet download manager también es posible descargar de esta plataforma, pero el problema que tienen todos, o por lo menos yo lo veo de esa forma, es que descargan entre 2 a 5 MB/s. Cuando me ha tocado descargar de Internet Archive, varios archivos con un peso considerable (varios gigas), la descarga que obtenía era casi siempre de 2 MB/s, suponte que quieres descargar un archivo de 60 GB, con 2 MB/s de bajada vas a demorar aprox 10 horas, lo cual es muchísimo tiempo. Investigando por internet por esta lentitud en la descarga, sólo he encontrado quejas de varios usuarios en distintos foros o redes sociales, por ejemplo Reddit, y consultando a los dueños de la página, me informaban que estaban al tanto de la baja velocidad de descarga pero "que pensaban solucionarlo en algún futuro", o sea que su software oficial descarga lento y lo saben. Ante esto, me he puesto en marcha para encontrar una solución y así poder descargar rápido de esta platforma y es como surgió IAD (Internet Archive Downloader), este proyecto que he hecho permite lograr descargar archivos de Intenert Archive logrando velocidades superiores a los 30 MB/s. Le he creado una interfaz gráfica para que sea más amigable con el usuario final.
+IAD is a Windows desktop application for downloading files from the [Internet Archive](https://archive.org/). Sign in with your Internet Archive account, choose the files you want, and download them in parallel.
 
-## Instalación
+![IAD v2 downloading files](iad-download-speed.png)
+
+## What's new in v2
+
+- Redesigned sign-in window, file picker, and download dashboard.
+- Search and filter files before adding them to the download queue.
+- Pause and resume individual files or the entire queue. Downloads resume from saved bytes while IAD stays open.
+- Automatically redistribute download workers as files finish or pause, and reuse HTTP connections between fragments.
+
+## Installation on Windows
+
+1. Install 64-bit Python 3. IAD v2 was tested with Python 3.13.
+2. Download and extract the [v2.0.0 source ZIP](https://github.com/fedemarkco/IAD-Internet-Archive-Downloader-/archive/refs/tags/v2.0.0.zip).
+3. Run `run-IAD.cmd`. On the first launch, it creates a local virtual environment and installs the dependencies from `requirements.txt`.
+
+If you already have a virtual environment, activate it and run these commands from the extracted folder:
+
+```bat
+python -m pip install -r requirements.txt
+python IAD.py
 ```
-pip install PyQt5
-pip install urllib3
-pip install requests
-```
 
-## Funcionamiento
-Al compilar el archivo python, te encontrarás con una ventana que te pide el usuario y contraseña de logueo de archive.org, cuando lo ingreses te llevará a otra ventana que te pedirá que ingreses una URL, seleccionar la carpeta donde quieres almacenar los archivos que se descarguen, y elegir la cantidad de archivos en paralelo a descargar. Ahora es cuando te preguntas, ¿Cuál URL tengo que ingresar? La respuesta es sencilla, la que tienes que descargar son las que comienzan con
+## How to download files
 
-**https://archive.org/download/**
+1. Sign in with your Internet Archive account.
+2. Open an Internet Archive item, click **Show All** under **Download Options**, and copy the file-listing URL. It should look like `https://archive.org/download/item-identifier`.
+3. Paste the URL into **Archive URL** and click **Search**.
+4. Select the files you want and click **Add selected**.
+5. Choose a destination folder with **Browse**, set **Concurrent files**, and click **Start downloads**.
 
-Estos enlaces los encuentras si accedes a los ítems de lo que quieres descargar, para ser más explícito, si realizas la búsqueda de, por ejemplo, **roms snes**, el buscador te mostrará varios resultados, si eliges alguno de ellos, te llevará a una pantalla donde en el lado derecho dice **DOWNLOAD OPTIONS**, mostrando distintas formas de descarga del archivo, lo que tienes que hacer en este caso, es hacer clic a la opción **SHOW ALL**. Y la URL a la que te redireccione, que comenzará como te mencioné anteriormente, tienes que copiarla completa y en la aplicación pegarla en donde dice **URL**, luego hacer click en el botón **Search**. Te aparecerá una pequeña ventana para seleccionar/deseleccionar los archivos que quieres descargar, que se encuentren en la URL que ingresaste. Aceptas la ventana y comenzará la búsqueda de archivos que puedan contener tu selección, para ser mostrados en la grilla que aparece abajo. También deberás seleccionar la carpeta donde almacenar los archivos que descargues haciendo clic en el botón **Save To Folder** y como plus también te da la posibilidad de descargar hasta 32 archivos en paralelo eligiendo de la lista de **Thread**. Paso final, hacer click en el botón **Start**.
+Right-click a row or use its **…** menu to open the destination folder, copy the filename, or pause or resume that file. Use **Pause all** and **Resume all** to control the entire queue.
 
-## Autor
-**Marco Weihmüller**
+Download speeds vary with the connection, the server, and the files in the queue.
 
-## Licencia
-Este proyecto está bajo la Licencia GNU General Public License v3.0
+## Original version
+
+The original interface and `project.py` are available in [IAD v1.0.0](https://github.com/fedemarkco/IAD-Internet-Archive-Downloader-/tree/v1.0.0).
+
+## Author
+
+Marco Weihmüller
+
+## License
+
+IAD is licensed under the [GNU General Public License v3.0](LICENSE).
