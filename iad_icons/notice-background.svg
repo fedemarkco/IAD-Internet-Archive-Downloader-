@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="344" viewBox="0 0 860 344">
+  <defs>
+    <radialGradient id="base" cx=".5" cy=".55" r=".7"><stop stop-color="#0a2c4b"/><stop offset="1" stop-color="#03182e"/></radialGradient>
+    <linearGradient id="wave" x1="0" y1="1" x2=".4" y2="0"><stop stop-color="#02172f"/><stop offset=".7" stop-color="#074080"/><stop offset="1" stop-color="#0578e8"/></linearGradient>
+    <linearGradient id="edge"><stop stop-color="#063976"/><stop offset=".25" stop-color="#06d7fa"/><stop offset=".5" stop-color="#0758b9"/><stop offset="1" stop-color="#042345"/></linearGradient>
+  </defs>
+  <path d="M0 0h860v344H0z" fill="url(#base)"/>
+  <path d="M0 0h236C140 9 84 78 0 78Z" fill="url(#wave)" stroke="url(#edge)" stroke-width="1.5"/>
+  <path d="M0 252c155-59 266 92 493 71 95-8 121-37 170-43C450 390 220 201 0 318Z" fill="url(#wave)"/>
+  <path d="M0 252c155-59 266 92 493 71 95-8 121-37 170-43" fill="none" stroke="url(#edge)" stroke-width="2"/>
+  <path d="M623 344c90-25 151-63 237-47v47Z" fill="url(#wave)" stroke="url(#edge)" stroke-width="1.5"/>
+</svg>
