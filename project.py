@@ -3,7 +3,7 @@ from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from operator import itemgetter
 from threading import Thread
-from queue import Queue
+from queue import Queue, Empty
 
 import urllib.parse
 import threading
@@ -16,337 +16,419 @@ import math
 import sys
 import re
 import os
+import warnings
 
+
+# Older PyQt5 builds emit this SIP warning when Qt classes are subclassed.
+warnings.filterwarnings(
+  "ignore",
+  message=r"^sipPyTypeDict\(\) is deprecated, the extension module should use sipPyTypeDictRef\(\) instead$",
+  category=DeprecationWarning,
+  module=rf"^{re.escape(__name__)}$",
+)
+
+USER_AGENT = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"}
+MAX_THREADS = 100
 
 sem = threading.Semaphore()
 urllib3.disable_warnings()
 
-class Archive_org(QObject):
+class ArchiveOrg(QObject):
   _response = pyqtSignal(object)
   _titles = pyqtSignal(list)
   _ql = pyqtSignal(list)
   _size = pyqtSignal(Queue)
 
-  def __init__(self, user=None, password=None, url=None, cookies=None, searchs=None, parent=None):
-    super(Archive_org, self).__init__(parent)
+  def __init__(self, user=None, password=None, url=None, cookies=None, search_results=None, parent=None):
+    super(ArchiveOrg, self).__init__(parent)
     self.url = url
     self.user = user
     self.password = password
     self.cookies = cookies
-    self.searchs = searchs
-    self.k = 0
-    self.qq = Queue()
-    self.ql = []
-    self.PATHD = os.path.dirname(__file__) + '\\'
+    self.search_results = search_results
+    self.directory_initialized = 0
+    self.file_queue = Queue()
+    self.file_list = []
+    self.path_d = os.path.dirname(__file__) + '\\'
+    self.total_threads = MAX_THREADS
+    self.user_agent = USER_AGENT
 
   def login(self):
-    urlLogin = "https://archive.org/services/account/login/"
-    urlCsrfToken = "https://archive.org/services/csrf-token"
-    response = requests.get(urlCsrfToken)
-    csrfToken = response.json()["value"]["token"]
-    sourcePost = requests.post(
-      urlLogin, 
+    url_login = "https://archive.org/services/account/login/"
+    url_csrf_token = "https://archive.org/services/csrf-token"
+    response = requests.get(url_csrf_token, headers=self.user_agent)
+    csrf_token = response.json()["value"]["token"]
+    source_post = requests.post(
+      url_login, 
       headers={
-        "x-csrf-token": csrfToken,
+        **self.user_agent,
+        "x-csrf-token": csrf_token,
       },
       cookies=response.cookies,
       json = {
         "username": self.user, 
-        "password": self.password, 
+        "password": self.password,
         "remember": "true", 
-        "t": csrfToken
+        "t": csrf_token
       }
     )
-    self._response.emit(sourcePost)
+    self._response.emit(source_post)
 
   def strip_tags(self, value):
     return re.compile(r'<[^<]*?/?>').sub("", value)
 
-  def getFileSize(self):
-    q = self.searchs
+  def get_file_size(self):
+    q = self.search_results
     out = Queue()
-    num_threads = min(200, q.qsize())
+    num_threads = min(self.total_threads, q.qsize())
     for i in range(num_threads):
-      worker = Thread(target=self.getFileSizeT, args=(q, out,))
-      worker.setDaemon(True)
+      worker = Thread(target=self.get_file_size_worker, args=(q, out,))
+      worker.daemon = True
       worker.start()
 
     q.join()
 
     self._size.emit(out)
 
-  def getFS(self, u):
+  def get_file_size_response(self, u):
+    max_retries = 5
+
+    for attempt in range(max_retries):
+      try:
+        with requests.get(
+          u[2],
+          cookies=self.cookies,
+          stream=True,
+          headers=self.user_agent,
+          timeout=(10, 60)
+        ) as response:
+          response.raise_for_status()
+          length = response.headers.get("Content-Length")
+          return (u[0], u[1], u[2], int(length) if length is not None else None, u[3])
+
+      except requests.HTTPError as error:
+        if error.response.status_code not in (429, 500, 502, 503, 504):
+          break
+
+      except (requests.RequestException, ValueError):
+        pass
+
+      if attempt < max_retries - 1:
+        time.sleep(2 ** attempt)
+
+    return (u[0], u[1], u[2], None, u[3])
+
+  def get_file_size_worker(self, q, out):
     while True:
       try:
-        source = requests.get(u[2], cookies = self.cookies, stream=True)
-        if source.status_code == 200:
-          break
-      except:
-        time.sleep(0.5)
-    try:
-      length = int(source.headers["Content-Length"])
-    except:
-      length = None
-    return (u[0], u[1], u[2], length, u[3])
+        u = q.get_nowait()
+      except Empty:
+        break
 
-  def getFileSizeT(self, q, out):
-    while not q.empty():
-      u = q.get()
       try:
-        o = self.getFS(u)
-        out.put((o[0], o[1], o[2], o[3], o[4]))
+        result = self.get_file_size_response(u)
+
+        if result[3] is not None:
+          out.put(result)
+
+      except Exception as error:
+        pass
+
+      finally:
         q.task_done()
-      except:
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-        q.put(u)
-        q.task_done()
 
-  def getA(self, cookies):
-    self.getD(cookies, self.url)
-    for _ql in self.ql:
-      self.qq.put(_ql)
+  def get_titles(self):
+    source = requests.get(self.url, cookies=self.cookies, headers=self.user_agent)
+    search_results = re.findall(r'<tr.*?>\s+<td><a\shref="(.*?)">(.*?)<\/a>', source.text)[1:]
+    self._titles.emit(search_results)
 
-  def getTitles(self):
-    source = requests.get(self.url, cookies=self.cookies)
-    searchs = re.findall('<tr.*?>\s+<td><a\shref="(.*?)">(.*?)<\/a>', source.text)[1:]
-    self._titles.emit(searchs)
+  def get_directory(self):
+    self.get_directory_recursive(self.search_results, self.cookies, self.url)
+    self._ql.emit(self.file_list)
 
-  def getD(self):
-    self.getD2(self.searchs, self.cookies, self.url)
-    self._ql.emit(self.ql)
-
-  def getD2(self, searchs, cookies, urlTemp='', folders='', listFilesD=[], listFilesURL=[]):
-    source = requests.get(urlTemp, cookies=cookies)
-    if self.k == 0:
-      self.k = 1
-      searchTemp = []
-      for m in searchs:
+  def get_directory_recursive(self, search_results, cookies, url_temp='', folders=''):
+    source = requests.get(url_temp, cookies=cookies, headers=self.user_agent)
+    if self.directory_initialized == 0:
+      self.directory_initialized = 1
+      search_temp = []
+      for m in search_results:
         if m[1][-1] != "/":
-          if urlTemp[-1] != "/":
-            urlTemp += "/"
-          self.ql.append((urlTemp+m[0], '', m[1], cookies))
+          if url_temp[-1] != "/":
+            url_temp += "/"
+          self.file_list.append((url_temp+m[0], '', m[1], cookies))
         else:
-          searchTemp.append(m)
-      searchs = searchTemp
+          search_temp.append(m)
+      search_results = search_temp
     else:
-      searchs = re.findall('<tr.*?>\s+<td><a\shref="(.*?)">(.*?)<\/a>', source.text)
+      search_results = re.findall(r'<tr.*?>\s+<td><a\shref="(.*?)">(.*?)<\/a>', source.text)
 
-    for d in range(len(searchs)):
-      if "to parent directory" in searchs[d][1]:
+    for d in range(len(search_results)):
+      if "to parent directory" in search_results[d][1]:
         continue
-      u = searchs[d][0] #url
-      f = searchs[d][1] #filename
-      if urlTemp[-1] != "/":
-        urlTemp += "/"
+      u = search_results[d][0] #url
+      f = search_results[d][1] #filename
+      if url_temp[-1] != "/":
+        url_temp += "/"
       if f[-1] == "/":
-        self.getD2(searchs, cookies, urlTemp+u, folders + f[:-1] + '\\')
+        self.get_directory_recursive(search_results, cookies, url_temp+u, folders + f[:-1] + '\\')
       else:
-        files = re.findall('<tr.*?>\s+<td><a\shref="(.*?)">.*?<\/a>', source.text)[1:]
+        files = re.findall(r'<tr.*?>\s+<td><a\shref="(.*?)">.*?<\/a>', source.text)[1:]
         for f in files:
-          if (urlTemp+f, folders, f, cookies) in self.ql:
+          if (url_temp+f, folders, f, cookies) in self.file_list:
             continue
-          self.ql.append((urlTemp+f, folders, f, cookies))
+          self.file_list.append((url_temp+f, folders, f, cookies))
 
 class Downloader(QThread):
-  _createProgressBar = pyqtSignal(list)
-  _updateStatus = pyqtSignal(int, int)
+  progress_updated = pyqtSignal(list)
+  status_updated = pyqtSignal(int, int)
   _finished = pyqtSignal()
 
-  def __init__(self, cookies, threads, infoFiles, dest, parent=None):
+  def __init__(self, cookies, threads, info_files, dest, parent=None):
     super(Downloader, self).__init__(parent)
     self.cookies = cookies
     self.num_threads = threads
-    self.infoFiles = infoFiles
+    self.info_files = info_files
     self.dest = dest
     self.chunk_size = 512000
-    self.speedFile = []
-    self.TotalThreads = 32
+    self.speed_file = []
+    self.total_threads = MAX_THREADS
+    self.download_semaphore = threading.BoundedSemaphore(self.total_threads)
+    self.progress_lock = threading.Lock()
+    self.user_agent = USER_AGENT
 
   def run(self):
-    self.TotalThreadsQueue = Queue()
-    self.ql = []
-    self.qIn = Queue()
+    self.file_list = []
+    self.input_queue = Queue()
 
-    for l in self.infoFiles:
-      self.qIn.put(l)
+    for l in self.info_files:
+      self.input_queue.put(l)
 
-    for tt in range(self.TotalThreads):
-      self.TotalThreadsQueue.put(1)
-
-    self.num_threads = min (self.num_threads, len(self.infoFiles))
+    self.num_threads = min (self.num_threads, len(self.info_files))
     for i in range(self.num_threads):
-      worker = Thread(target=self.downlT, args=(self.qIn,))
+      worker = Thread(target=self.download_thread, args=(self.input_queue,))
       worker.start()
 
-    self.qIn.join()
+    self.input_queue.join()
     self._finished.emit()
 
     if os.path.isdir("__pycache__"):
       shutil.rmtree("__pycache__")
 
-  def arrancar(self, q, url, dest, filesize, index, start, start_time):
-    while not q.empty():
-      u = q.get()
+  def update_download_progress(self, index, fragment_start, downloaded_bytes, filesize, start):
+    with self.progress_lock:
+      state = next(item for item in self.speed_file if item["id"] == index)
+
+      state["active_fragments"][fragment_start] = downloaded_bytes
+
+      now = time.perf_counter()
+
+      if now - state["last_update"] < 0.25:
+        return
+
+      state["last_update"] = now
+
+      total_bytes = state["speed"] + sum(state["active_fragments"].values())
+      elapsed = max(now - start, 0.001)
+
+      speed = total_bytes / elapsed
+      remaining = max(0, (filesize - total_bytes) / speed) if filesize and speed > 0 else None
+
+      progress = int(total_bytes * 100 / filesize) if filesize else 0
+      progress = min(progress, 100)
+
+      self.progress_updated.emit([
+        total_bytes,
+        round(elapsed),
+        speed,
+        progress,
+        index,
+        "Downloading",
+        round(remaining) if remaining is not None else None
+      ])
+
+  def download_worker(self, q, url, dest, filesize, index, start, start_time):
+    while True:
       try:
-        self.getFile(u[0], u[1], u[2], url, dest, filesize, index, start, start_time)
-      except:
-        q.put(u)
-      q.task_done()
+        a, b, filename = q.get_nowait()
+      except Empty:
+        return
 
-  def createFile(self, dest, filename, index):
-    k = 0
-    for k in range(len(self.speedFile)):
-      if self.speedFile[k]["id"] == index:
-        break
+      try:
+        success = False
 
-    self.speedFile[k]["body"].sort()
-    self._updateStatus.emit(index, 1)
+        for attempt in range(3):
+          try:
+            with self.download_semaphore:
+              fragment_path = self.get_file(
+                a, b, filename, url, dest, filesize, index, start, start_time
+              )
 
-    wfd = open(os.path.join(dest, filename), "wb")
-    for c in self.speedFile[k]["body"]:
-      fd = open(os.path.join(dest, filename+'-'+str(c[0])+str(c[1])), "rb")
-      shutil.copyfileobj(fd, wfd)
-      fd.close()
-    wfd.close()
+            with self.progress_lock:
+              state = next(item for item in self.speed_file if item["id"] == index)
+              state["body"].append((a, b, fragment_path))
 
-    for c in self.speedFile[k]["body"]:
-      os.remove(os.path.join(dest, filename+'-'+str(c[0])+str(c[1])))
+            success = True
+            break
 
-    self._updateStatus.emit(index, 2)
+          except (requests.RequestException, OSError) as error:
+            if attempt < 2:
+              time.sleep(2 ** attempt)
 
-  def writeFragment(self, dest, filename, fragment):
+        if not success:
+          with self.progress_lock:
+            state = next(item for item in self.speed_file if item["id"] == index)
+            state["failed"] = True
+
+      finally:
+        q.task_done()
+
+  def create_file(self, dest, filename, index):
+    state = next(item for item in self.speed_file if item["id"] == index)
+    fragments = sorted(state["body"], key=lambda item: item[0])
+
+    self.status_updated.emit(index, 1)
+
+    output_path = os.path.join(dest, filename)
+    temporary_path = output_path + ".building"
+
+    with open(temporary_path, "wb") as output:
+      for a, b, fragment_path in fragments:
+        with open(fragment_path, "rb") as source:
+          shutil.copyfileobj(source, output)
+
+    os.replace(temporary_path, output_path)
+
+    for a, b, fragment_path in fragments:
+      os.remove(fragment_path)
+
+    self.status_updated.emit(index, 2)
+
+  def write_fragment(self, dest, filename, fragment):
     f = open(os.path.join(dest, filename), "wb")
     f.write(fragment)
     f.close()
 
-  def getFile(self, a, b, filename, url, dest, filesize, index, start, start_time):
-    k = 0
-    for k in range(len(self.speedFile)):
-      if self.speedFile[k]["id"] == index:
-        break
+  def get_file(self, a, b, filename, url, dest, filesize, index, start, start_time):
+    fragment_path = os.path.join(dest, f"{filename}-{a}-{b}.part")
+    temporary_path = fragment_path + ".tmp"
+
+    headers = dict(self.user_agent)
 
     if filesize is not None:
-      r = requests.get(
-        url, 
-        headers = {"Range": "bytes=%d-%d" % (a, b)}, 
-        cookies = self.cookies, 
-        verify = False, 
-        stream = True
-      )
-    else:
-      r = requests.get(url, cookies = self.cookies, verify = False, stream = True)
+      headers["Range"] = f"bytes={a}-{b}"
 
-    for chunk in r.iter_content(chunk_size=self.chunk_size):
-      speed = 0
-      self.speedFile[k]["speed"] += len(chunk)
+    try:
+      with requests.get(
+        url,
+        headers=headers,
+        cookies=self.cookies,
+        stream=True,
+        timeout=(10, 60)
+      ) as response:
+        response.raise_for_status()
 
-      if filesize is not None:
-        self.speedFile[k]["perc"] += 1
-        percentage = self.speedFile[k]["perc"]/self.speedFile[k]["chunks"]
-        self._createProgressBar.emit(
-          [self.speedFile[k]["speed"], 
-          round(time.perf_counter() - start), 
-          self.speedFile[k]["speed"]/(time.perf_counter() - start), 
-          int(percentage*100), 
-          index, 
-          "Downloading"]
-        )
-      else:
-        self._createProgressBar.emit(
-          [self.speedFile[k]["speed"], 
-          round(time.perf_counter() - start), 
-          "-", 
-          0, 
-          index, 
-          "Downloading"]
-        )
+        if filesize is not None:
+          if response.status_code != 206:
+            raise requests.RequestException("Server did not honor the requested range")
 
-      self.speedFile[k]["body"].append(
-        (a, self.speedFile[k]["speed"], filename + "-" + str(a))
-      )
-      self.writeFragment(
-        dest, 
-        filename + "-" + str(a) + str(self.speedFile[k]["speed"]), 
-        chunk
-      )
-      self.TotalThreadsQueue.put(1)
+          expected_range = f"bytes {a}-{b}/{filesize}"
+          if response.headers.get("Content-Range") != expected_range:
+            raise requests.RequestException("Unexpected Content-Range")
 
-  def prepareDownload(self, filename, dest, url, filesize, index):
+        downloaded_bytes = 0
+
+        with open(temporary_path, "wb") as output:
+          for chunk in response.iter_content(chunk_size=self.chunk_size):
+            if not chunk:
+              continue
+
+            output.write(chunk)
+            downloaded_bytes += len(chunk)
+
+            self.update_download_progress(
+              index, a, downloaded_bytes, filesize, start
+            )
+
+        if filesize is not None and downloaded_bytes != b - a + 1:
+          raise requests.RequestException("Incomplete fragment")
+
+        os.replace(temporary_path, fragment_path)
+
+      with self.progress_lock:
+        state = next(item for item in self.speed_file if item["id"] == index)
+        state["speed"] += downloaded_bytes
+        state["active_fragments"].pop(a, None)
+
+      return fragment_path
+
+    except Exception:
+      with self.progress_lock:
+        state = next(item for item in self.speed_file if item["id"] == index)
+        state["active_fragments"].pop(a, None)
+      if os.path.exists(temporary_path):
+        os.remove(temporary_path)
+      raise
+
+  def prepare_download(self, filename, dest, url, filesize, index):
+    if not filename.strip():
+      filename = os.path.basename(urllib.parse.urlparse(url).path)
+
+    os.makedirs(dest, exist_ok=True)
+
+    state = {
+      "id": index,
+      "url": url,
+      "filename": filename,
+      "speed": 0,
+      "body": [],
+      "failed": False,
+      "active_fragments": {},
+      "last_update": 0
+    }
+
+    with self.progress_lock:
+      self.speed_file.append(state)
+
     q = Queue()
 
-    if filename.strip() == "":
-      filename = os.path.basename(url)
-
-    sem.acquire()
-
-    dest = dest.replace("\\", "/")
-
-    if dest.strip() != "":
-      if not os.path.isdir(dest):
-        os.makedirs(dest)
-
-    self.speedFile.append(
-      {
-        "id": index, 
-        "url": url, 
-        "filename": filename, 
-        "speed": 0, 
-        "perc": 0, 
-        "chunks": 0, 
-        "body": []
-      }
-    )
-
-    res = []
-
     if filesize is not None:
-      if filesize <= 3000000:
-        trunks = 1
-      else:
-        trunks = math.ceil(filesize/3000000)
+      if filesize <= 0:
+        self.status_updated.emit(index, 3)
+        return
 
-      size = math.ceil(filesize/trunks)
-      chunks = math.ceil(filesize/self.chunk_size)
-      i = 0
-      while True:
-        start = size * i
-        if (start + size) >= filesize:
-          end = filesize
-          q.put((start, end-1, filename))
-          self.speedFile[len(self.speedFile)-1]["chunks"] += math.ceil((end-start)/self.chunk_size)
-          break
-        else:
-          end = start + size
-          q.put((start, end-1, filename))
-          self.speedFile[len(self.speedFile)-1]["chunks"] += math.ceil((end-start)/self.chunk_size)
-        i += 1
+      for a in range(0, filesize, 3000000):
+        b = min(a + 3000000, filesize) - 1
+        q.put((a, b, filename))
     else:
       q.put((0, 0, filename))
-    sem.release()
 
     start = time.perf_counter()
     start_time = time.time()
 
-    for k in range(len(self.speedFile)):
-      if self.speedFile[k]["id"] == index:
-        break
+    worker_count = min(self.total_threads, q.qsize())
+    workers = []
 
-    while not q.empty():
-      if not self.TotalThreadsQueue.empty():
-        self.TotalThreadsQueue.get()
-        worker = Thread(target=self.arrancar, args=(q, url, dest, filesize, index, start, start_time,))
-        worker.setDaemon(True)
-        worker.start()
+    for i in range(worker_count):
+      worker = Thread(
+        target=self.download_worker,
+        args=(q, url, dest, filesize, index, start, start_time)
+      )
+      worker.start()
+      workers.append(worker)
 
-    q.join()
+    for worker in workers:
+      worker.join()
 
-    self.createFile(dest, filename, index)
+    if state["failed"]:
+      self.status_updated.emit(index, 3)
+      return
 
-  def downlT(self, q):
+    self.create_file(dest, filename, index)
+
+  def download_thread(self, q):
     while not q.empty():
         u = q.get()
-        self.prepareDownload(
+        self.prepare_download(
           urllib.parse.unquote(u[0]), 
           os.path.join(self.dest, u[1]), 
           u[2], 
@@ -358,15 +440,15 @@ class ChecklistDialog(QDialog):
   def __init__(self, parent=None):
     super(ChecklistDialog, self).__init__(parent)
     self.parent = parent
-    self.pressButton = False
+    self.button_pressed = False
     self.name = self.parent.name
     self.icon = None
     self.model = QStandardItemModel()
-    self.listView = QListView()
-    stringlist = self.parent.listFiles
+    self.list_view = QListView()
+    string_list = self.parent.list_files
     checked = True
 
-    for string in stringlist:
+    for string in string_list:
       item = QStandardItem(string[1])
       item.setEditable(False)
       item.setCheckable(True)
@@ -375,20 +457,20 @@ class ChecklistDialog(QDialog):
       item.setCheckState(check)
       self.model.appendRow(item)
 
-    self.listView.setModel(self.model)
-    self.model.itemChanged.connect(self.click2)
-    self.okButton = QPushButton("OK")
-    self.selectButton = QPushButton("Select All")
-    self.unselectButton = QPushButton("Unselect All")
+    self.list_view.setModel(self.model)
+    self.model.itemChanged.connect(self.on_item_changed)
+    self.ok_button = QPushButton("OK")
+    self.select_button = QPushButton("Select All")
+    self.unselect_button = QPushButton("Unselect All")
 
     hbox = QHBoxLayout()
     hbox.addStretch(1)
-    hbox.addWidget(self.okButton)
-    hbox.addWidget(self.selectButton)
-    hbox.addWidget(self.unselectButton)
+    hbox.addWidget(self.ok_button)
+    hbox.addWidget(self.select_button)
+    hbox.addWidget(self.unselect_button)
 
     vbox = QVBoxLayout(self)
-    vbox.addWidget(self.listView)
+    vbox.addWidget(self.list_view)
     vbox.addStretch(1)
     vbox.addLayout(hbox)
 
@@ -397,9 +479,9 @@ class ChecklistDialog(QDialog):
     if self.icon:
       self.setWindowIcon(self.icon)
 
-    self.okButton.clicked.connect(self.onAccepted)
-    self.selectButton.clicked.connect(self.select)
-    self.unselectButton.clicked.connect(self.unselect)
+    self.ok_button.clicked.connect(self.on_accepted)
+    self.select_button.clicked.connect(self.select)
+    self.unselect_button.clicked.connect(self.unselect)
 
     self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
 
@@ -408,30 +490,30 @@ class ChecklistDialog(QDialog):
   def strip_tags(self, value):
     return re.compile(r'<[^<]*?/?>').sub("", value)
 
-  def onAccepted(self):
+  def on_accepted(self):
     self.choices = [self.model.item(i).text() for i in
                     range(self.model.rowCount())
                     if self.model.item(i).checkState()
                     == Qt.Checked]
     self.accept()
 
-  def click2(self, item):
-    if self.pressButton:
-      self.listView.setCurrentIndex(item.index())
+  def on_item_changed(self, item):
+    if self.button_pressed:
+      self.list_view.setCurrentIndex(item.index())
 
   def select(self):
-    self.pressButton = False
+    self.button_pressed = False
     for i in range(self.model.rowCount()):
       item = self.model.item(i)
       item.setCheckState(Qt.Checked)
-    self.pressButton = True
+    self.button_pressed = True
 
   def unselect(self):
-    self.pressButton = False
+    self.button_pressed = False
     for i in range(self.model.rowCount()):
       item = self.model.item(i)
       item.setCheckState(Qt.Unchecked)
-    self.pressButton = True
+    self.button_pressed = True
 
 class WLogin(QDialog):
   def __init__(self, parent=None):
@@ -445,25 +527,25 @@ class WLogin(QDialog):
 
     self.user = QLineEdit("")
     self.user.setPlaceholderText("user")
-    self.passw = QLineEdit("")
-    self.passw.setPlaceholderText("password")
-    self.passw.setEchoMode(QLineEdit.Password)
-    self.buttonLogin = QPushButton("Login")
+    self.password_input = QLineEdit("")
+    self.password_input.setPlaceholderText("password")
+    self.password_input.setEchoMode(QLineEdit.Password)
+    self.button_login = QPushButton("Login")
 
     log = QHBoxLayout()
     log.addWidget(self.user)
-    log.addWidget(self.passw)
-    log.addWidget(self.buttonLogin)
+    log.addWidget(self.password_input)
+    log.addWidget(self.button_login)
 
-    messageWidget = QVBoxLayout()
-    messageWidget.addWidget(self.message)
+    message_widget = QVBoxLayout()
+    message_widget.addWidget(self.message)
 
-    loginLayout = QGridLayout()
-    loginLayout.addLayout(log, 0, 0, 5, 78)
-    loginLayout.addLayout(messageWidget, 6, 31, 1, 10)
-    self.setLayout(loginLayout)
+    login_layout = QGridLayout()
+    login_layout.addLayout(log, 0, 0, 5, 78)
+    login_layout.addLayout(message_widget, 6, 31, 1, 10)
+    self.setLayout(login_layout)
 
-    self.buttonLogin.clicked.connect(self.login)
+    self.button_login.clicked.connect(self.login)
 
     self.setWindowTitle("IAD (Internet Archive Downloader) - Login")
 
@@ -473,19 +555,18 @@ class WLogin(QDialog):
     QApplication.setStyle(QStyleFactory.create("Fusion"))
 
   def login(self):
-    out = Queue()
-    self.buttonLogin.setEnabled(False)
+    self.button_login.setEnabled(False)
     self.message.setText("Verifying...")
     self.message.repaint()
-    self._archive_org = Archive_org(self.user.text(), self.passw.text(), None, None, None)
+    self._archive_org = ArchiveOrg(self.user.text(), self.password_input.text(), None, None, None)
     thread = QThread(self)
     self._archive_org.moveToThread(thread)
-    self._archive_org._response.connect(self.loginT)
+    self._archive_org._response.connect(self.login_result)
     thread.started.connect(self._archive_org.login)
     thread.start()
   
   @pyqtSlot(object)
-  def loginT(self, response):
+  def login_result(self, response):
     message = response.json()
     self.cookies = response.cookies
     if message.get("success", None):
@@ -497,11 +578,11 @@ class WLogin(QDialog):
     else:
       self.message.setText("Failed")
       self.message.repaint()
-    self.buttonLogin.setEnabled(True)
+    self.button_login.setEnabled(True)
 
 class ProgressBar(QProgressBar):
   def __init__(self, value, parent=None):
-    QProgressBar.__init__(self)
+    super().__init__(parent)
     self.setMinimum(0)
     self.setMaximum(100)
     self.setValue(value)
@@ -517,79 +598,79 @@ class Main(QDialog):
     self.setFixedWidth(600)
     self.setFixedHeight(600)
 
-    self.infoFiles = []
+    self.info_files = []
     self.count = 0
     self.finished = False
 
-    self.urlLine = QLineEdit("")
+    self.url_line = QLineEdit("")
 
-    urlLabel = QLabel("&URL:")
-    urlLabel.setBuddy(self.urlLine)
+    url_label = QLabel("&URL:")
+    url_label.setBuddy(self.url_line)
 
-    self.buttonSearch = QPushButton("Search")
+    self.button_search = QPushButton("Search")
 
-    self.searchingLabel = QLabel("")
-    self.searchingLabel.setStyleSheet("color: red;")
+    self.searching_label = QLabel("")
+    self.searching_label.setStyleSheet("color: red;")
 
-    WsearchLabel = QVBoxLayout()
-    WsearchLabel.addWidget(self.searchingLabel)
+    search_label_layout = QVBoxLayout()
+    search_label_layout.addWidget(self.searching_label)
 
-    threadLabel = QLabel("&Thread:")
-    self.threadComboBox = QComboBox()
-    self.threadComboBox.addItems(["1", "2", "4", "8", "16", "32"])
-    threadLabel.setBuddy(self.threadComboBox)
+    thread_label = QLabel("&Thread:")
+    self.thread_combo_box = QComboBox()
+    self.thread_combo_box.addItems(["1", "2", "4", "8", "16", "32"])
+    thread_label.setBuddy(self.thread_combo_box)
 
-    self.fpath = QLabel("")
+    self.folder_path_label = QLabel("")
 
-    buttonFolder = QPushButton("Save To Folder")
+    button_folder = QPushButton("Save To Folder")
 
-    self.buttonStart = QPushButton("Start")
-    self.buttonStart.setEnabled(False)
-    self.buttonClean = QPushButton("Clean")
-    buttonExit = QPushButton("Exit")
+    self.button_start = QPushButton("Start")
+    self.button_start.setEnabled(False)
+    self.button_clean = QPushButton("Clean")
+    button_exit = QPushButton("Exit")
 
-    self.createTable()
+    self.create_table()
 
     table = QVBoxLayout()
-    table.addWidget(self.tableWidget)
+    table.addWidget(self.table_widget)
 
-    topLayout2 = QHBoxLayout()
-    topLayout2.addWidget(threadLabel)
-    topLayout2.addWidget(self.threadComboBox)
-    topLayout2.addWidget(buttonFolder)
+    top_layout_2 = QHBoxLayout()
+    top_layout_2.addWidget(thread_label)
+    top_layout_2.addWidget(self.thread_combo_box)
+    top_layout_2.addWidget(button_folder)
 
-    topLayout = QHBoxLayout()
-    topLayout.addWidget(urlLabel)
-    topLayout.addWidget(self.urlLine)
-    topLayout.addWidget(self.buttonSearch)
+    top_layout = QHBoxLayout()
+    top_layout.addWidget(url_label)
+    top_layout.addWidget(self.url_line)
+    top_layout.addWidget(self.button_search)
 
-    topLayout3 = QHBoxLayout()
-    topLayout3.addWidget(self.fpath)
+    top_layout_3 = QHBoxLayout()
+    top_layout_3.addWidget(self.folder_path_label)
 
-    buttonStartClean = QHBoxLayout()
-    buttonStartClean.addWidget(self.buttonStart)
-    buttonStartClean.addWidget(self.buttonClean)
+    button_start_clean = QHBoxLayout()
+    button_start_clean.addWidget(self.button_start)
+    button_start_clean.addWidget(self.button_clean)
 
-    buttonEx = QHBoxLayout()
-    buttonEx.addWidget(buttonExit)
+    button_exit_layout = QHBoxLayout()
+    button_exit_layout.addWidget(button_exit)
 
-    mainLayout = QGridLayout()
-    mainLayout.addLayout(topLayout, 0, 0, 2, 78)
-    topLayout.setContentsMargins(0, 15, 0, 40)
-    mainLayout.addLayout(WsearchLabel, 1, 30, 1, 10)
-    mainLayout.addLayout(topLayout2, 2, 0, 1, 1)
-    mainLayout.addLayout(topLayout3, 2, 1, 1, 70)
-    mainLayout.addLayout(table, 3, 0, 1, 78)
-    mainLayout.addLayout(buttonStartClean, 4, 0, 1, 30)
-    mainLayout.addLayout(buttonEx, 4, 63, 1, 15)
+    main_layout = QGridLayout()
+    main_layout.addLayout(top_layout, 0, 0, 2, 78)
+    top_layout.setContentsMargins(0, 15, 0, 40)
+    main_layout.addLayout(search_label_layout, 1, 30, 1, 10)
+    main_layout.addLayout(top_layout_2, 2, 0, 1, 1)
+    main_layout.addLayout(top_layout_3, 2, 1, 1, 70)
+    main_layout.addLayout(table, 3, 0, 1, 78)
+    main_layout.addLayout(button_start_clean, 4, 0, 1, 30)
+    main_layout.addLayout(button_exit_layout, 4, 63, 1, 15)
     table.setContentsMargins(0, 30, 0, 0)
-    self.setLayout(mainLayout)
+    self.setLayout(main_layout)
 
-    self.buttonSearch.clicked.connect(self.search)
-    buttonFolder.clicked.connect(self.selectFolder)
-    self.buttonClean.clicked.connect(self.selectClean)
-    self.buttonStart.clicked.connect(self.selectStart)
-    buttonExit.clicked.connect(self.close)
+    self.button_search.clicked.connect(self.search)
+    button_folder.clicked.connect(self.select_folder)
+    self.button_clean.clicked.connect(self.select_clean)
+    self.button_start.clicked.connect(self.select_start)
+    button_exit.clicked.connect(self.close)
 
     self.setWindowTitle("IAD (Internet Archive Downloader)")
 
@@ -599,7 +680,7 @@ class Main(QDialog):
     QApplication.setStyle(QStyleFactory.create("Fusion"))
 
   def mousePressEvent(self, e):
-    self.tableWidget.clearSelection()
+    self.table_widget.clearSelection()
 
   def get_size_format(self, b, factor=1024, suffix="B"):
     for unit in ["", "K", "M", "G", "T", "P", "E", "Z"]:
@@ -609,10 +690,10 @@ class Main(QDialog):
     return f"{b:.2f}Y {suffix}"
 
   @pyqtSlot(list)
-  def insertProgressBarTable(self, values):
-    self.updateRow(values[0], values[1], values[2], values[3], values[4], values[5])
+  def insert_progress_bar_table(self, values):
+    self.update_row(*values)
 
-  def checkUrl(self, url):
+  def check_url(self, url):
     if len(url.strip()) == 0:
       return "V"
     if not url.startswith("https://archive.org/download/"):
@@ -625,7 +706,7 @@ class Main(QDialog):
       else:
         return False
 
-  def messageSearch(self, title, text):
+  def message_search(self, title, text):
     msg = QMessageBox(self)
     msg.setWindowTitle(title)
     msg.setIcon(QMessageBox.Warning)
@@ -633,118 +714,116 @@ class Main(QDialog):
     msg.exec_()
 
   def search(self):
-    _type = self.checkUrl(self.urlLine.text())
+    _type = self.check_url(self.url_line.text())
     if isinstance(_type, str):
       if _type == "V":
-        self.messageSearch("Wrong url", "The URL cannot be empty")
+        self.message_search("Wrong url", "The URL cannot be empty")
       if _type == "E":
-        self.messageSearch("Wrong url", "The URL should be as follows:\nhttps://archive.org/download/example")
+        self.message_search("Wrong url", "The URL should be as follows:\nhttps://archive.org/download/example")
     if isinstance(_type, bool):
       if not _type:
-        self.messageSearch("Wrong url", "The URL should be as follows:\nhttps://archive.org/download/example")
+        self.message_search("Wrong url", "The URL should be as follows:\nhttps://archive.org/download/example")
       else:
-        self.buttonSearch.setEnabled(False)
-        self.searchingLabel.setText("Searching...")
-        self.searchingLabel.repaint()
-        self._archive_org = Archive_org(None, None, self.urlLine.text(), self.cookies, None)
+        self.button_search.setEnabled(False)
+        self.searching_label.setText("Searching...")
+        self.searching_label.repaint()
+        self._archive_org = ArchiveOrg(None, None, self.url_line.text(), self.cookies, None)
         thread = QThread(self)
         self._archive_org.moveToThread(thread)
-        self._archive_org._titles.connect(self.searchT)
-        thread.started.connect(self._archive_org.getTitles)
+        self._archive_org._titles.connect(self.search_step_1)
+        thread.started.connect(self._archive_org.get_titles)
         thread.start()
 
   @pyqtSlot(list)
-  def searchT(self, listFiles):
-    q, out = Queue(), Queue()
-    info, searchs, self.infoFiles = [], [], []
-    self.listFiles = listFiles
+  def search_step_1(self, list_files):
+    search_results = []
+    self.info_files = []
+    self.list_files = list_files
     self.name = "Found"
-    self.searchingLabel.setText("")
-    self.searchingLabel.repaint()
-    self.checkList = ChecklistDialog(self)
-    url = self.urlLine.text()
+    self.searching_label.setText("")
+    self.searching_label.repaint()
+    self.check_list = ChecklistDialog(self)
+    url = self.url_line.text()
 
     if url[-1] != "/":
       url += "/"
 
-    if self.checkList.exec_() == QDialog.Accepted:
-      self.selectClean()
-      for s in self.checkList.choices:
-        for k in self.listFiles:
+    if self.check_list.exec_() == QDialog.Accepted:
+      self.select_clean()
+      for s in self.check_list.choices:
+        for k in self.list_files:
           if k[1] == s:
-            searchs.append(k)
-      if len(searchs) > 0:
-        self.searchingLabel.setText("Getting links...")
-        self.searchingLabel.repaint()
-        self._archive_org.k = 0
-        self._archive_org.ql.clear()
-        self._archive_org = Archive_org(None, None, self.urlLine.text(), self.cookies, searchs)
+            search_results.append(k)
+      if len(search_results) > 0:
+        self.searching_label.setText("Getting links...")
+        self.searching_label.repaint()
+        self._archive_org = ArchiveOrg(None, None, self.url_line.text(), self.cookies, search_results)
         thread = QThread(self)
         self._archive_org.moveToThread(thread)
-        self._archive_org._ql.connect(self.searchT2)
-        thread.started.connect(self._archive_org.getD)
+        self._archive_org._ql.connect(self.search_step_2)
+        thread.started.connect(self._archive_org.get_directory)
         thread.start()
 
-    self.buttonSearch.setEnabled(True)
+    self.button_search.setEnabled(True)
 
   @pyqtSlot(list)
-  def searchT2(self, ql):
+  def search_step_2(self, ql):
     q = Queue()
     index = 0
 
     for u in ql:
-      urlFile = u[0]
+      url_file = u[0]
       dest = u[1]
       filename = u[2]
-      q.put((filename, dest, urlFile, index))
+      q.put((filename, dest, url_file, index))
       index += 1
 
-    self._archive_org = Archive_org(None, None, None, self.cookies, q)
+    self._archive_org = ArchiveOrg(None, None, None, self.cookies, q)
     thread = QThread(self)
     self._archive_org.moveToThread(thread)
-    self._archive_org._size.connect(self.searchT3)
-    thread.started.connect(self._archive_org.getFileSize)
+    self._archive_org._size.connect(self.search_step_3)
+    thread.started.connect(self._archive_org.get_file_size)
     thread.start()
 
-  def refreshProgressBar(self):
-    if len(self.infoFiles) > 0:
-      progressValue = self.tableWidget.cellWidget(0, 5).value()
-      self.tableWidget.removeCellWidget(0, 5)
-      progressBar = ProgressBar(progressValue)
-      self.tableWidget.setCellWidget(0, 5, progressBar)
+  def refresh_progress_bar(self):
+    if len(self.info_files) > 0:
+      progress_value = self.table_widget.cellWidget(0, 5).value()
+      self.table_widget.removeCellWidget(0, 5)
+      progress_bar = ProgressBar(progress_value)
+      self.table_widget.setCellWidget(0, 5, progress_bar)
   
   @pyqtSlot(Queue)
-  def searchT3(self, out):
+  def search_step_3(self, out):
     if out.qsize() <= 15:
-      self.tableWidget.setRowCount(15)
-      for row in range(self.tableWidget.rowCount()):
-        self.tableWidget.setRowHeight(row, 10)
+      self.table_widget.setRowCount(15)
+      for row in range(self.table_widget.rowCount()):
+        self.table_widget.setRowHeight(row, 10)
     else:
-      self.tableWidget.setRowCount(out.qsize())
+      self.table_widget.setRowCount(out.qsize())
 
     size = out.qsize()
 
     while not out.empty():
       res = out.get()
       if res[3] is not None:
-        self.addRowTable(res[0], self.get_size_format(res[3]), res[4])
+        self.add_row_table(res[0], self.get_size_format(res[3]), res[4])
       else:
-        self.addRowTable(res[0], '-', res[4])
-      self.infoFiles.append((res[0], res[1], res[2], res[3], res[4]))
+        self.add_row_table(res[0], '-', res[4])
+      self.info_files.append((res[0], res[1], res[2], res[3], res[4]))
 
-    self.searchingLabel.setText("")
-    self.searchingLabel.repaint()
+    self.searching_label.setText("")
+    self.searching_label.repaint()
 
     self.setWindowTitle("IAD (Internet Archive Downloader) - 0/{0} files".format(size))
 
-    self.buttonStart.setEnabled(True)
+    self.button_start.setEnabled(True)
     self.finished = False
 
-  def hideLogin(self):
-    self.myWidget.setVisible(False)
+  def hide_login(self):
+    self.my_widget.setVisible(False)
 
-  def selectStart(self):
-    if self.fpath.text() == "":
+  def select_start(self):
+    if self.folder_path_label.text() == "":
       msg = QMessageBox(self)
       msg.setWindowTitle("Information")
       msg.setIcon(QMessageBox.Warning)
@@ -753,143 +832,147 @@ class Main(QDialog):
     else:
 
       if self.finished:
-        self.zeroProgress()
+        self.zero_progress()
 
-      self.infoFiles = sorted(self.infoFiles, key=itemgetter(2))
+      self.info_files = sorted(self.info_files, key=itemgetter(2))
       self._downloader = Downloader(
         self.cookies, 
-        int(self.threadComboBox.currentText()), 
-        self.infoFiles, 
-        self.fpath.text(), 
+        int(self.thread_combo_box.currentText()), 
+        self.info_files, 
+        self.folder_path_label.text(), 
         self
       )
-      self._downloader._createProgressBar.connect(self.insertProgressBarTable)
-      self._downloader._updateStatus.connect(self.updateStatus)
+      self._downloader.progress_updated.connect(self.insert_progress_bar_table)
+      self._downloader.status_updated.connect(self.update_status)
       self._downloader.start()
-      self.buttonClean.setEnabled(False)
-      self.buttonSearch.setEnabled(False)
-      self.buttonStart.setEnabled(False)
-      self._downloader._finished.connect(self.butSt)
+      self.button_clean.setEnabled(False)
+      self.button_search.setEnabled(False)
+      self.button_start.setEnabled(False)
+      self._downloader._finished.connect(self.button_start_finished)
 
       self.count = 0
       self.finished = True
 
   @pyqtSlot()
-  def butSt(self):
-    self.buttonSearch.setEnabled(True)
-    self.buttonStart.setEnabled(True)
-    self.buttonClean.setEnabled(True)
+  def button_start_finished(self):
+    self.button_search.setEnabled(True)
+    self.button_start.setEnabled(True)
+    self.button_clean.setEnabled(True)
 
-  def zeroProgress(self):
-    size = len(self.infoFiles)
+  def zero_progress(self):
+    size = len(self.info_files)
     self.setWindowTitle("IAD (Internet Archive Downloader) - 0/{0} files".format(size))
 
-    for index in range(len(self.infoFiles)):
-      self.tableWidget.setItem(index, 1, QTableWidgetItem(""))
-      size = re.search('.*?\/(.*)', self.tableWidget.item(index, 2).text())
+    for index in range(len(self.info_files)):
+      self.table_widget.setItem(index, 1, QTableWidgetItem(""))
+      size = re.search(r'.*?\/(.*)', self.table_widget.item(index, 2).text())
       size = size.group(1).strip()
-      self.tableWidget.setItem(index, 2, QTableWidgetItem("0 / "+size))
-      self.tableWidget.setItem(index, 3, QTableWidgetItem(""))
-      self.tableWidget.setItem(index, 4, QTableWidgetItem(""))
-      progressBar = self.tableWidget.cellWidget(index, 5)
-      progressBar.setValue(0)
+      self.table_widget.setItem(index, 2, QTableWidgetItem("0 / "+size))
+      self.table_widget.setItem(index, 3, QTableWidgetItem(""))
+      self.table_widget.setItem(index, 4, QTableWidgetItem(""))
+      progress_bar = self.table_widget.cellWidget(index, 5)
+      progress_bar.setValue(0)
 
-  def selectClean(self):
-    self.infoFiles.clear()
-    self.tableWidget.clearContents()
-    self.tableWidget.setRowCount(15)
-    self.buttonStart.setEnabled(False)
+  def select_clean(self):
+    self.info_files.clear()
+    self.table_widget.clearContents()
+    self.table_widget.setRowCount(15)
+    self.button_start.setEnabled(False)
 
-  def selectFolder(self):
+  def select_folder(self):
     dialog = QFileDialog(self)
-    folderPath = dialog.getExistingDirectory(self, "Select Folder")
-    if self.fpath.text() != '' and folderPath == '':
-      folderPath = self.fpath.text()
-    if len(folderPath) > 60:
-      folderPath = folderPath[:60]+'...'
-    self.fpath.setText(folderPath)
+    folder_path = dialog.getExistingDirectory(self, "Select Folder")
+    if self.folder_path_label.text() != '' and folder_path == '':
+      folder_path = self.folder_path_label.text()
+    if len(folder_path) > 60:
+      folder_path = folder_path[:60]+'...'
+    self.folder_path_label.setText(folder_path)
 
-  def addRowTable(self, filename, size, index):
+  def add_row_table(self, filename, size, index):
     filename = urllib.parse.unquote(filename)
-    self.tableWidget.setItem(index, 0, QTableWidgetItem(filename))
+    self.table_widget.setItem(index, 0, QTableWidgetItem(filename))
 
     if size != '':
-      self.tableWidget.setItem(index, 2, QTableWidgetItem("0 / "+size))
+      self.table_widget.setItem(index, 2, QTableWidgetItem("0 / "+size))
     else:
-      self.tableWidget.setItem(index, 2, QTableWidgetItem("-"))
+      self.table_widget.setItem(index, 2, QTableWidgetItem("-"))
 
-    progressBar = ProgressBar(0)
+    progress_bar = ProgressBar(0)
 
-    self.tableWidget.setCellWidget(index, 5, progressBar)
-    self.tableWidget.setRowHeight(index, 10)
+    self.table_widget.setCellWidget(index, 5, progress_bar)
+    self.table_widget.setRowHeight(index, 10)
 
-  def createProgressBar(self, _max):
-    self.progressBar = QProgressBar()
-    self.progressBar.setRange(0, _max)
-    self.progressBar.setValue(0)
-    return self.progressBar
+  def create_progress_bar(self, _max):
+    self.progress_bar = QProgressBar()
+    self.progress_bar.setRange(0, _max)
+    self.progress_bar.setValue(0)
+    return self.progress_bar
 
-  def createTable(self):
-    self.tableView = QHeaderView(Qt.Horizontal)
-    self.tableView.sectionResized.connect(self.refreshProgressBar)
-    self.tableWidget = QTableWidget()
+  def create_table(self):
+    self.table_view = QHeaderView(Qt.Horizontal)
+    self.table_view.sectionResized.connect(self.refresh_progress_bar)
+    self.table_widget = QTableWidget()
     self.setFixedHeight(496)
-    self.tableWidget.setRowCount(15)
-    self.tableWidget.setColumnCount(6)
-    self.tableWidget.setHorizontalHeaderLabels(
+    self.table_widget.setRowCount(15)
+    self.table_widget.setColumnCount(6)
+    self.table_widget.setHorizontalHeaderLabels(
       [
         "Filename", 
         "Status", 
         "Uploaded / Size", 
-        "Time", 
+        "Time / Remaining", 
         "Speed", 
         "Progress"
       ]
     )
-    self.tableWidget.verticalHeader().setVisible(False)
+    self.table_widget.verticalHeader().setVisible(False)
 
-    for row in range(self.tableWidget.rowCount()):
-      self.tableWidget.setRowHeight(row, 10)
+    for row in range(self.table_widget.rowCount()):
+      self.table_widget.setRowHeight(row, 10)
 
-    self.tableWidget.setHorizontalHeader(self.tableView)
-    self.tableWidget.horizontalHeader().setStretchLastSection(True)
-    self.tableWidget.setColumnWidth(1, 78);
-    self.tableWidget.setColumnWidth(2, 130);
-    self.tableWidget.setColumnWidth(3, 55);
-    self.tableWidget.setColumnWidth(4, 75);
-    self.tableWidget.setEditTriggers(self.tableWidget.NoEditTriggers)
+    self.table_widget.setHorizontalHeader(self.table_view)
+    self.table_widget.horizontalHeader().setStretchLastSection(True)
+    self.table_widget.setColumnWidth(1, 78)
+    self.table_widget.setColumnWidth(2, 110)
+    self.table_widget.setColumnWidth(3, 105)
+    self.table_widget.setColumnWidth(4, 75)
+    self.table_widget.setEditTriggers(self.table_widget.NoEditTriggers)
     
   @pyqtSlot(int, int)
-  def updateStatus(self, index, option):
+  def update_status(self, index, option):
     if option == 1:
-      self.tableWidget.setItem(index, 1, QTableWidgetItem("Building File"))
+      self.table_widget.setItem(index, 1, QTableWidgetItem("Building File"))
     if option == 2:
-      progressBar = self.tableWidget.cellWidget(index, 5).setValue(100)
-      self.tableWidget.setItem(index, 1, QTableWidgetItem("Done"))
+      progress_bar = self.table_widget.cellWidget(index, 5).setValue(100)
+      self.table_widget.setItem(index, 1, QTableWidgetItem("Done"))
       self.count += 1
       title = self.windowTitle()
-      title = re.sub('\s\d+', ' '+str(self.count), title)
+      title = re.sub(r' - \d+/', f' - {self.count}/', title)
       self.setWindowTitle(title)
+    if option == 3:
+      self.table_widget.setItem(index, 1, QTableWidgetItem("Failed"))
 
-  def updateRow(self, uploadSize, _time, speed, progress, index, status):
-    self.tableWidget.setItem(index, 1, QTableWidgetItem(status))
+  def update_row(self, upload_size, _time, speed, progress, index, status, remaining):
+    self.table_widget.setItem(index, 1, QTableWidgetItem(status))
 
-    size = self.tableWidget.item(index, 2).text().split("/")[1].strip()
-    self.tableWidget.setItem(index, 2, QTableWidgetItem(self.get_size_format(uploadSize) + " / " + size))
+    size = self.table_widget.item(index, 2).text().split("/")[1].strip()
+    self.table_widget.setItem(index, 2, QTableWidgetItem(self.get_size_format(upload_size) + " / " + size))
 
-    self.tableWidget.setItem(index, 3, QTableWidgetItem(str(datetime.timedelta(seconds=_time))))
+    elapsed_text = str(datetime.timedelta(seconds=_time))
+    remaining_text = str(datetime.timedelta(seconds=remaining)) if remaining is not None else "--:--:--"
+
+    self.table_widget.setItem(index, 3, QTableWidgetItem(f"{elapsed_text} / {remaining_text}"))
 
     if speed != "-":
-      self.tableWidget.setItem(index, 4, QTableWidgetItem(self.get_size_format(speed) + "/s"))
+      self.table_widget.setItem(index, 4, QTableWidgetItem(self.get_size_format(speed) + "/s"))
     else:
-      self.tableWidget.setItem(index, 4, QTableWidgetItem(speed))
+      self.table_widget.setItem(index, 4, QTableWidgetItem(speed))
 
-    progressBar = self.tableWidget.cellWidget(index, 5)
-    if progressBar.value() < progress:
-      progressBar.setValue(progress)
+    progress_bar = self.table_widget.cellWidget(index, 5)
+    progress_bar.setValue(progress)
 
 if __name__ == "__main__":
-    app = QApplication([])
-    gallery = WLogin()
-    gallery.show()
-    sys.exit(app.exec_())
+  app = QApplication([])
+  gallery = WLogin()
+  gallery.show()
+  sys.exit(app.exec_())
